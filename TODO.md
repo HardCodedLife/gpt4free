@@ -9,11 +9,11 @@
 ### Environment Setup
 - [✅] Fork gpt4free repository to personal GitHub
 - [✅] Clone forked repository locally
-- [ ] ❌ Create and activate Python virtual environment
-- [ ] ❌ Install dependencies: `pip install -r requirements.txt`
-- [ ] ❌ Install additional packages: `pip install -U g4f[all]`
+- [✅] Create and activate Python virtual environment
+- [✅] Install dependencies: `pip install -r requirements.txt`
+- [✅] Install additional packages: `pip install -U g4f[all]`
 - [ ] ❌ Create `.env` file from `.env.example`
-- [ ] ❌ Test local g4f GUI: `python -m g4f.cli gui --port 8080`
+- [✅] Test local g4f GUI: `python -m g4f.cli gui --port 8080`
 
 ### Ollama Server Testing
 - [ ] ❌ Create `test_ollama.py` connectivity script
