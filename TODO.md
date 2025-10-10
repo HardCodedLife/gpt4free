@@ -16,12 +16,12 @@
 - [✅] Test local g4f GUI: `python -m g4f.cli gui --port 8080`
 
 ### Ollama Server Testing
-- [ ] ❌ Create `test_ollama.py` connectivity script
-- [ ] ❌ Test `/api/tags` endpoint (list models)
-- [ ] ❌ Test `/api/chat` endpoint (basic chat)
+- [✅] Create `test_ollama.py` connectivity script
+- [✅] Test `/api/tags` endpoint (list models)
+- [✅] Test `/api/chat` endpoint (basic chat)
 - [ ] ❌ Document available models on Ollama server
-- [ ] ❌ Test streaming responses
-- [ ] ❌ Verify network access from development machine
+- [✅] Test streaming responses
+- [✅] Verify network access from development machine
 
 ### Provider Implementation
 - [ ] 🔥 Create `g4f/Provider/Ollama.py`
