@@ -12,8 +12,10 @@ from ..providers.response import Reasoning, PlainTextResponse, PreviewResponse, 
 from ..errors import RateLimitError, ProviderException, MissingAuthError
 from ..cookies import get_cookies
 from ..tools.auth import AuthManager
+from ..tools.media import merge_media
+from ..image import is_accepted_format, to_bytes
 from .yupp.models import YuppModelManager
-from .helper import get_last_message
+from .helper import get_last_user_message
 from ..debug import log
 
 # Global variables to manage Yupp accounts (should be set by your main application)
@@ -95,38 +97,6 @@ def get_best_yupp_account() -> Optional[Dict[str, Any]]:
         account["last_used"] = now
         return account
 
-def format_messages_for_yupp(messages: List[Dict[str, str]]) -> str:
-    """Format multi-turn conversation for Yupp single-turn format"""
-    if len(messages) == 1:
-        return messages[0].get("content", "").strip()
-
-    formatted = []
-
-    # Handle system messages
-    system_messages = [msg for msg in messages if msg.get("role") == "system"]
-    if system_messages:
-        for sys_msg in system_messages:
-            content = sys_msg.get("content", "")
-            formatted.append(content)
-
-    # Handle user and assistant messages
-    user_assistant_msgs = [msg for msg in messages if msg.get("role") != "system"]
-    for msg in user_assistant_msgs:
-        role = "Human" if msg.get("role") == "user" else "Assistant"
-        content = msg.get("content", "")
-        formatted.append(f"\n\n{role}: {content}")
-
-    # Ensure it ends with Assistant:
-    if not formatted or not formatted[-1].strip().startswith("Assistant:"):
-        formatted.append("\n\nAssistant:")
-
-    result = "".join(formatted)
-    # Remove leading \n\n if present
-    if result.startswith("\n\n"):
-        result = result[2:]
-
-    return result
-
 def claim_yupp_reward(account: Dict[str, Any], reward_id: str):
     """Claim Yupp reward synchronously"""
     try:
@@ -198,13 +168,11 @@ class Yupp(AbstractProvider, ProviderModelMixin):
         Create completion using Yupp.ai API with account rotation
         """
         # Initialize Yupp accounts and models
-        if not api_key and len(YUPP_ACCOUNTS) <= 1:
+        if not api_key:
             api_key = get_cookies("yupp.ai", False).get("__Secure-yupp.session-token")
         if api_key:
             load_yupp_accounts(api_key)
             log_debug(f"Yupp provider initialized with {len(YUPP_ACCOUNTS)} accounts")
-        elif YUPP_ACCOUNTS:
-            log_debug(f"Yupp provider using existing accounts: {len(YUPP_ACCOUNTS)}")
         else:
             raise MissingAuthError("No Yupp accounts configured. Set YUPP_API_KEY environment variable.")
 
@@ -212,14 +180,9 @@ class Yupp(AbstractProvider, ProviderModelMixin):
             messages = []
         
         # Format messages
-        if conversation is None or True:
-            if prompt is None:
-                prompt = format_messages_for_yupp(messages)
-            url_uuid = str(uuid.uuid4())
-            yield JsonConversation(url_uuid=url_uuid)
-        else:
-            if prompt is None:
-                prompt = get_last_message(messages)
+        prompt = get_last_user_message(messages, prompt)
+        url_uuid = None
+        if conversation is not None:
             url_uuid = conversation.url_uuid
         log_debug(f"Use url_uuid: {url_uuid}, Formatted prompt length: {len(prompt)}")
         
@@ -232,7 +195,7 @@ class Yupp(AbstractProvider, ProviderModelMixin):
             
             try:
                 yield from cls._make_yupp_request(
-                    account, prompt, model, url_uuid, **kwargs
+                    account, messages, prompt, model, url_uuid, **kwargs
                 )
                 return  # Success, exit the loop
                 
@@ -261,18 +224,98 @@ class Yupp(AbstractProvider, ProviderModelMixin):
     def _make_yupp_request(
         cls,
         account: Dict[str, Any],
-        question: str,
+        messages: List[Dict[str, str]],
+        prompt: str,
         model_id: str,
         url_uuid: Optional[str] = None,
+        media: List[str] = None,
         next_action: str = "7f2a2308b5fc462a2c26df714cb2cccd02a9c10fbb",
         **kwargs
     ) -> Generator[str, Any, None]:
         """Make actual request to Yupp.ai"""
+
+        session = create_requests_session()
+
+        files = []
+        for file, name in list(merge_media(media, messages)):
+            data = to_bytes(file)
+            url = "https://yupp.ai/api/trpc/chat.createPresignedURLForUpload?batch=1"
+            payload = {
+                "0": {
+                    "json": {
+                        "fileName": name,
+                        "fileSize": len(data),
+                        "contentType": is_accepted_format(data)
+                    }
+                }
+            }
+            response = session.post(url, json=payload, headers={
+                "Content-Type": "application/json",
+                "Cookie": f"__Secure-yupp.session-token={account['token']}",
+            })
+            response.raise_for_status()
+            upload_info = response.json()[0]["result"]["data"]["json"]
+            upload_url = upload_info["signedUrl"]
+            upload_resp = session.put(upload_url, data=data, headers={
+                "Content-Type": is_accepted_format(data),
+                "Cookie": f"__Secure-yupp.session-token={account['token']}",
+                "Content-Length": str(len(data)),
+            })
+            upload_resp.raise_for_status()
+            url = "https://yupp.ai/api/trpc/chat.createAttachmentForUploadedFile?batch=1"
+            response = session.post(url, json={
+                "0": {
+                    "json": {
+                        "fileName": name,
+                        "contentType": is_accepted_format(data),
+                        "fileId": upload_info["fileId"],
+                    }
+                }
+            }, cookies={
+                "__Secure-yupp.session-token": account["token"]
+            })
+            response.raise_for_status()
+            attachment = response.json()[0]["result"]["data"]["json"]
+            files.append({
+                "fileName": attachment["file_name"],
+                "contentType": attachment["content_type"],
+                "attachmentId": attachment["attachment_id"],
+                "chatMessageId": ""
+            })
         
-        # Build request
+        # Build request 
+        log_debug(f"Sending request to Yupp.ai with account: {account['token'][:10]}...")
+
+        turn_id = str(uuid.uuid4())
         if url_uuid is None:
             url_uuid = str(uuid.uuid4())
-        url = f"https://yupp.ai/chat/{url_uuid}?stream=true"
+            payload = [
+                url_uuid,
+                turn_id,
+                prompt,
+                "$undefined",
+                "$undefined",
+                files,
+                "$undefined",
+                [{"modelName": model_id, "promptModifierId": "$undefined"}]  if model_id else "none",
+                "text",
+                False,
+                "$undefined",
+            ]
+            yield JsonConversation(url_uuid=url_uuid)
+        else:
+            payload = [
+                url_uuid,
+                turn_id,
+                prompt,
+                False,
+                [],
+                [{"modelName": model_id, "promptModifierId": "$undefined"}] if model_id else [],
+                "text",
+                files
+            ]
+            url = f"https://yupp.ai/chat/{url_uuid}?stream=true"
+            next_action = "7f1e9eec4ab22c8bfc73a50c026db603cd8380f87d"
         
         headers = {
             "accept": "text/x-component",
@@ -280,25 +323,10 @@ class Yupp(AbstractProvider, ProviderModelMixin):
             "next-action": next_action,
             "cookie": f"__Secure-yupp.session-token={account['token']}",
         }
-        
-        log_debug(f"Sending request to Yupp.ai with account: {account['token'][:10]}...")
 
-        payload = [
-            url_uuid,
-            str(uuid.uuid4()),
-            question,
-            "$undefined",
-            "$undefined",
-            [],
-            "$undefined",
-            [{"modelName": model_id, "promptModifierId": "$undefined"}]  if model_id else "none",
-            "text",
-            False,
-            "$undefined",
-        ]
+        log_debug(f"Request uuid: {url_uuid}, Model: {model_id}, Prompt length: {len(prompt)}, Files: {len(files)}")
         
         # Send request
-        session = create_requests_session()
         response = session.post(
             url,
             data=json.dumps(payload),
@@ -309,9 +337,9 @@ class Yupp(AbstractProvider, ProviderModelMixin):
         response.raise_for_status()
         
         yield from cls._process_stream_response(
-            response.iter_lines(), account, session, question, model_id
+            response.iter_lines(), account, session, prompt, model_id
         )
-    
+
     @classmethod
     def _process_stream_response(
         cls,
